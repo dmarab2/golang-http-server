@@ -1,13 +1,21 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
+	"time"
+
+	"github.com/dmarab2/golang-http-server/internal/database"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
 var censoredWords = map[string]bool{
@@ -20,6 +28,15 @@ var censoredWords = map[string]bool{
 // (atomic ints are safe to be called across goroutines)
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	db             *database.Queries
+}
+
+// a new user from the database is converted into this before getting turned into JSON
+type jsonUser struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
 }
 
 // middleware for an HTTP handler that wraps it in an outer handler that first calls
@@ -54,6 +71,33 @@ func (cfg *apiConfig) resetWriter(w http.ResponseWriter, req *http.Request) {
 	io.WriteString(w, "Reset OK")
 }
 
+func (cfg *apiConfig) createUserWriter(w http.ResponseWriter, req *http.Request) {
+	type parameters struct {
+		email string
+	}
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		log.Printf("Error decoding parameters: %s", err)
+		w.WriteHeader(500)
+		return
+	}
+	user, err := cfg.db.CreateUser(req.Context(), params.email)
+	if err != nil {
+		respondWithError(w, 400, "Unable to make the user.")
+		return
+	}
+	jsonUser := jsonUser{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+	}
+	respondWithJSON(w, 201, jsonUser)
+
+}
+
 // helper function to write a JSON error if something goes wrong during handling
 func respondWithError(w http.ResponseWriter, code int, msg string) {
 	type errorStruct struct {
@@ -82,10 +126,11 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(200)
+	w.WriteHeader(code)
 	w.Write(data)
 }
 
+// helper function to censor a chirp
 func censorChirp(preString string) (finalString string) {
 	preStringSlice := strings.Split(preString, " ")
 	finalStringSlice := make([]string, len(preStringSlice))
@@ -127,8 +172,16 @@ func validationHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 func main() {
+	godotenv.Load()
+	dbURL := os.Getenv("DB_URL")
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		fmt.Println("Something went wrong!")
+		os.Exit(1)
+	}
+	dbQueries := database.New(db)
 	// a server multiplexer that will handle the various paths.
-	cfg := &apiConfig{fileserverHits: atomic.Int32{}}
+	cfg := &apiConfig{fileserverHits: atomic.Int32{}, db: dbQueries}
 	serveMux := http.NewServeMux()
 	server := &http.Server{
 		Addr:    ":8080",
@@ -149,5 +202,6 @@ func main() {
 	serveMux.HandleFunc("GET /admin/metrics", cfg.metricsWriter)
 	serveMux.HandleFunc("POST /admin/reset", cfg.resetWriter)
 	serveMux.HandleFunc("POST /api/validate_chirp", validationHandler)
+	serveMux.HandleFunc("POST /api/users", cfg.createUserWriter)
 	server.ListenAndServe()
 }
