@@ -29,6 +29,7 @@ var censoredWords = map[string]bool{
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
+	platform       string
 }
 
 // a new user from the database is converted into this before getting turned into JSON
@@ -65,15 +66,21 @@ func (cfg *apiConfig) metricsWriter(w http.ResponseWriter, req *http.Request) {
 
 // used with the /reset endpoint to reset the file server hit count
 func (cfg *apiConfig) resetWriter(w http.ResponseWriter, req *http.Request) {
+	if cfg.platform != "dev" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
 	cfg.fileserverHits.Store(0)
+	cfg.db.DeleteAllUsers(req.Context())
+	w.WriteHeader(http.StatusOK)
 	io.WriteString(w, "Reset OK")
 }
 
 func (cfg *apiConfig) createUserWriter(w http.ResponseWriter, req *http.Request) {
 	type parameters struct {
-		email string
+		Email string `json:"email"`
 	}
 	decoder := json.NewDecoder(req.Body)
 	params := parameters{}
@@ -83,7 +90,8 @@ func (cfg *apiConfig) createUserWriter(w http.ResponseWriter, req *http.Request)
 		w.WriteHeader(500)
 		return
 	}
-	user, err := cfg.db.CreateUser(req.Context(), params.email)
+	fmt.Printf("User email is %v", params.Email)
+	user, err := cfg.db.CreateUser(req.Context(), params.Email)
 	if err != nil {
 		respondWithError(w, 400, "Unable to make the user.")
 		return
@@ -96,6 +104,17 @@ func (cfg *apiConfig) createUserWriter(w http.ResponseWriter, req *http.Request)
 	}
 	respondWithJSON(w, 201, jsonUser)
 
+}
+
+func (cfg *apiConfig) resetUserWriter(w http.ResponseWriter, req *http.Request) {
+	if cfg.platform != "dev" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	cfg.db.DeleteAllUsers(req.Context())
+	w.WriteHeader(http.StatusOK)
 }
 
 // helper function to write a JSON error if something goes wrong during handling
@@ -181,7 +200,7 @@ func main() {
 	}
 	dbQueries := database.New(db)
 	// a server multiplexer that will handle the various paths.
-	cfg := &apiConfig{fileserverHits: atomic.Int32{}, db: dbQueries}
+	cfg := &apiConfig{fileserverHits: atomic.Int32{}, db: dbQueries, platform: os.Getenv("PLATFORM")}
 	serveMux := http.NewServeMux()
 	server := &http.Server{
 		Addr:    ":8080",
