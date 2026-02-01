@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dmarab2/golang-http-server/internal/auth"
 	"github.com/dmarab2/golang-http-server/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -38,6 +39,14 @@ type jsonUser struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+}
+
+type jsonChirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	User_id   uuid.UUID `json:"user_id"`
 }
 
 // middleware for an HTTP handler that wraps it in an outer handler that first calls
@@ -78,9 +87,20 @@ func (cfg *apiConfig) resetWriter(w http.ResponseWriter, req *http.Request) {
 	io.WriteString(w, "Reset OK")
 }
 
+func turnUserToJson(user database.User) jsonUser {
+	jsonUser := jsonUser{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+	}
+	return jsonUser
+}
+
 func (cfg *apiConfig) createUserWriter(w http.ResponseWriter, req *http.Request) {
 	type parameters struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 	decoder := json.NewDecoder(req.Body)
 	params := parameters{}
@@ -90,22 +110,26 @@ func (cfg *apiConfig) createUserWriter(w http.ResponseWriter, req *http.Request)
 		w.WriteHeader(500)
 		return
 	}
-	fmt.Printf("User email is %v", params.Email)
-	user, err := cfg.db.CreateUser(req.Context(), params.Email)
+	hashedPassword, err := auth.HashPassword(params.Password)
+	if err != nil {
+		respondWithError(w, 400, "Unable to make the user, password is wrong.")
+		return
+	}
+	createUserParams := database.CreateUserParams{
+		Email:          params.Email,
+		HashedPassword: hashedPassword,
+	}
+	user, err := cfg.db.CreateUser(req.Context(), createUserParams)
 	if err != nil {
 		respondWithError(w, 400, "Unable to make the user.")
 		return
 	}
-	jsonUser := jsonUser{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
-	}
+	jsonUser := turnUserToJson(user)
 	respondWithJSON(w, 201, jsonUser)
 
 }
 
+// function to write a new User from a POST request to the database
 func (cfg *apiConfig) resetUserWriter(w http.ResponseWriter, req *http.Request) {
 	if cfg.platform != "dev" {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -115,6 +139,122 @@ func (cfg *apiConfig) resetUserWriter(w http.ResponseWriter, req *http.Request) 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	cfg.db.DeleteAllUsers(req.Context())
 	w.WriteHeader(http.StatusOK)
+}
+
+func (cfg *apiConfig) loginUser(w http.ResponseWriter, req *http.Request) {
+	type parameters struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		log.Printf("Error decoding parameters: %s", err)
+		w.WriteHeader(500)
+		return
+	}
+	databaseUser, err := cfg.db.GetSingleUser(req.Context(), params.Email)
+	fmt.Println(databaseUser.Email)
+	fmt.Println(databaseUser.HashedPassword)
+	if err != nil {
+		respondWithError(w, 401, "incorrect email or password")
+		return
+	}
+	samePassword, err := auth.CheckPasswordHash(params.Password, databaseUser.HashedPassword)
+	if err != nil {
+		respondWithError(w, 401, "incorrect email or password")
+		return
+	}
+	if !(samePassword) {
+		respondWithError(w, 401, "incorrect email or password")
+		return
+	}
+	jsonUser := turnUserToJson(databaseUser)
+	respondWithJSON(w, 200, jsonUser)
+
+}
+
+func (cfg *apiConfig) createChirpWriter(w http.ResponseWriter, req *http.Request) {
+	type parameters struct {
+		Body    string    `json:"body"`
+		User_id uuid.UUID `json:"user_id"`
+	}
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		log.Printf("Error decoding parameters: %s", err)
+		w.WriteHeader(500)
+		return
+	}
+	if len(params.Body) > 140 {
+		respondWithError(w, 400, "Chirp is too long")
+		return
+	}
+	cleanedChirp := censorChirp(params.Body)
+	insertDatabaseChirp := database.CreateChirpParams{
+		Body:   cleanedChirp,
+		UserID: params.User_id,
+	}
+	databaseChirp, err := cfg.db.CreateChirp(req.Context(), insertDatabaseChirp)
+	if err != nil {
+		respondWithError(w, 400, "Unable to make the Chirp.")
+		return
+	}
+	jsonChirp := turnChirpToJson(databaseChirp)
+	respondWithJSON(w, 201, jsonChirp)
+
+}
+
+func (cfg *apiConfig) getAllChirps(w http.ResponseWriter, req *http.Request) {
+	allChirps, err := cfg.db.GetAllChirps(req.Context())
+	if err != nil {
+		respondWithError(w, 400, "Unable to retrieve Chirps.")
+		return
+	}
+	jsonChirpSlice := make([]jsonChirp, 0, len(allChirps))
+	for _, chirpStruct := range allChirps {
+		jsonChirp := turnChirpToJson(chirpStruct)
+		jsonChirpSlice = append(jsonChirpSlice, jsonChirp)
+	}
+	fmt.Println(jsonChirpSlice)
+	data, err := json.Marshal(jsonChirpSlice)
+	if err != nil {
+		log.Printf("Error marshaling json: %s", err)
+		w.WriteHeader(500)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+}
+
+func (cfg *apiConfig) getSingleChirp(w http.ResponseWriter, req *http.Request) {
+	stringChirpID := req.PathValue("chirpID")
+	chirpID, err := uuid.Parse(stringChirpID)
+	if err != nil {
+		respondWithError(w, 404, "Unable to parse chirp ID.")
+		return
+	}
+	chirp, err := cfg.db.GetSingleChirp(req.Context(), chirpID)
+	if err != nil {
+		respondWithError(w, 404, "Chirp was not found.")
+		return
+	}
+	jsonChirp := turnChirpToJson(chirp)
+	respondWithJSON(w, 200, jsonChirp)
+}
+
+func turnChirpToJson(chirpStruct database.Chirp) jsonChirp {
+	jsonChirp := jsonChirp{
+		ID:        chirpStruct.ID,
+		CreatedAt: chirpStruct.CreatedAt,
+		UpdatedAt: chirpStruct.UpdatedAt,
+		Body:      chirpStruct.Body,
+		User_id:   chirpStruct.UserID,
+	}
+	return jsonChirp
 }
 
 // helper function to write a JSON error if something goes wrong during handling
@@ -220,7 +360,10 @@ func main() {
 	serveMux.HandleFunc("GET /api/healthz", endpointFunc)
 	serveMux.HandleFunc("GET /admin/metrics", cfg.metricsWriter)
 	serveMux.HandleFunc("POST /admin/reset", cfg.resetWriter)
-	serveMux.HandleFunc("POST /api/validate_chirp", validationHandler)
 	serveMux.HandleFunc("POST /api/users", cfg.createUserWriter)
+	serveMux.HandleFunc("GET /api/chirps", cfg.getAllChirps)
+	serveMux.HandleFunc("POST /api/chirps", cfg.createChirpWriter)
+	serveMux.HandleFunc("GET /api/chirps/{chirpID}", cfg.getSingleChirp)
+	serveMux.HandleFunc("POST /api/login", cfg.loginUser)
 	server.ListenAndServe()
 }
