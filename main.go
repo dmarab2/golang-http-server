@@ -31,6 +31,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	platform       string
+	secret         string
 }
 
 // a new user from the database is converted into this before getting turned into JSON
@@ -141,6 +142,7 @@ func (cfg *apiConfig) resetUserWriter(w http.ResponseWriter, req *http.Request) 
 	w.WriteHeader(http.StatusOK)
 }
 
+// for now, just checks that the user's password matches the stored hash
 func (cfg *apiConfig) loginUser(w http.ResponseWriter, req *http.Request) {
 	type parameters struct {
 		Email    string `json:"email"`
@@ -175,6 +177,7 @@ func (cfg *apiConfig) loginUser(w http.ResponseWriter, req *http.Request) {
 
 }
 
+// handler to create a chirp from a POST request
 func (cfg *apiConfig) createChirpWriter(w http.ResponseWriter, req *http.Request) {
 	type parameters struct {
 		Body    string    `json:"body"`
@@ -207,6 +210,7 @@ func (cfg *apiConfig) createChirpWriter(w http.ResponseWriter, req *http.Request
 
 }
 
+// returns all chirps from the database. will be edited later for filtering.
 func (cfg *apiConfig) getAllChirps(w http.ResponseWriter, req *http.Request) {
 	allChirps, err := cfg.db.GetAllChirps(req.Context())
 	if err != nil {
@@ -230,6 +234,7 @@ func (cfg *apiConfig) getAllChirps(w http.ResponseWriter, req *http.Request) {
 	w.Write(data)
 }
 
+// get a single chirp.
 func (cfg *apiConfig) getSingleChirp(w http.ResponseWriter, req *http.Request) {
 	stringChirpID := req.PathValue("chirpID")
 	chirpID, err := uuid.Parse(stringChirpID)
@@ -246,6 +251,7 @@ func (cfg *apiConfig) getSingleChirp(w http.ResponseWriter, req *http.Request) {
 	respondWithJSON(w, 200, jsonChirp)
 }
 
+// helper function to turn a database chirp into a JSON ready struct for marshaling.
 func turnChirpToJson(chirpStruct database.Chirp) jsonChirp {
 	jsonChirp := jsonChirp{
 		ID:        chirpStruct.ID,
@@ -340,7 +346,7 @@ func main() {
 	}
 	dbQueries := database.New(db)
 	// a server multiplexer that will handle the various paths.
-	cfg := &apiConfig{fileserverHits: atomic.Int32{}, db: dbQueries, platform: os.Getenv("PLATFORM")}
+	cfg := &apiConfig{fileserverHits: atomic.Int32{}, db: dbQueries, platform: os.Getenv("PLATFORM"), secret: os.Getenv("SECRET_KEY")}
 	serveMux := http.NewServeMux()
 	server := &http.Server{
 		Addr:    ":8080",
