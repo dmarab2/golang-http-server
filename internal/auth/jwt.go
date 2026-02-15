@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strings"
@@ -18,10 +17,7 @@ func MakeJWT(userID uuid.UUID, tokenSecret string, expiresIn time.Duration) (str
 		ExpiresAt: jwt.NewNumericDate(time.Now().UTC().Add(expiresIn)),
 		Subject:   userID.String(),
 	})
-	byteSecret, err := base64.StdEncoding.DecodeString(tokenSecret)
-	if err != nil {
-		return "", err
-	}
+	byteSecret := []byte(tokenSecret)
 	completeJWT, err := newJWTToken.SignedString(byteSecret)
 	if err != nil {
 		return "", err
@@ -30,10 +26,11 @@ func MakeJWT(userID uuid.UUID, tokenSecret string, expiresIn time.Duration) (str
 }
 
 func ValidateJWT(tokenString, tokenSecret string) (uuid.UUID, error) {
-	token, err := jwt.ParseWithClaims(tokenString, &jwt.RegisteredClaims{}, func(token *jwt.Token) (any, error) {
-		return base64.StdEncoding.DecodeString(tokenSecret)
+	token, err := jwt.ParseWithClaims(tokenString, &jwt.RegisteredClaims{}, func(token *jwt.Token) (interface{}, error) {
+		return []byte(tokenSecret), nil
 	})
 	if err != nil {
+		fmt.Printf("Failed after validation")
 		return uuid.UUID{}, err
 	} else if claims, ok := token.Claims.(*jwt.RegisteredClaims); ok {
 		uuidConversion, err := uuid.Parse(claims.Subject)
@@ -53,6 +50,6 @@ func GetBearerToken(headers http.Header) (string, error) {
 	}
 	headerList := strings.Fields(authorizationHeader)
 	tokenString := headerList[1]
+	fmt.Printf("The token string received from GetBearerToken is %v\n", tokenString)
 	return tokenString, nil
-
 }

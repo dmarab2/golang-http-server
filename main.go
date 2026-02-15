@@ -19,6 +19,8 @@ import (
 	_ "github.com/lib/pq"
 )
 
+var EXPIRETIME int = 3600
+
 var censoredWords = map[string]bool{
 	"kerfuffle": true,
 	"sharbert":  true,
@@ -97,6 +99,26 @@ func turnUserToJson(user database.User) jsonUser {
 	}
 	return jsonUser
 }
+func addTokenToUser(user database.User, token string, refreshToken string) interface{} {
+	jsonUser := turnUserToJson(user)
+	tokenUser := struct {
+		ID           uuid.UUID `json:"id"`
+		CreatedAt    time.Time `json:"created_at"`
+		UpdatedAt    time.Time `json:"updated_at"`
+		Email        string    `json:"email"`
+		Token        string    `json:"token"`
+		RefreshToken string    `json:"refresh_token"`
+	}{
+		ID:           jsonUser.ID,
+		CreatedAt:    jsonUser.CreatedAt,
+		UpdatedAt:    jsonUser.UpdatedAt,
+		Email:        jsonUser.Email,
+		Token:        token,
+		RefreshToken: refreshToken,
+	}
+	return tokenUser
+
+}
 
 func (cfg *apiConfig) createUserWriter(w http.ResponseWriter, req *http.Request) {
 	type parameters struct {
@@ -172,16 +194,30 @@ func (cfg *apiConfig) loginUser(w http.ResponseWriter, req *http.Request) {
 		respondWithError(w, 401, "incorrect email or password")
 		return
 	}
-	jsonUser := turnUserToJson(databaseUser)
-	respondWithJSON(w, 200, jsonUser)
+	tokenString, err := auth.MakeJWT(databaseUser.ID, cfg.secret, time.Duration(EXPIRETIME)*time.Second)
+	refreshTokenString, _ := auth.MakeRefreshToken()
+	fmt.Printf("made token: %q\n", tokenString)
+	refreshTokenParams := database.CreateRefreshTokenParams{
+		Token:  refreshTokenString,
+		UserID: databaseUser.ID,
+	}
+	refreshToken, err := cfg.db.CreateRefreshToken(req.Context(), refreshTokenParams)
+	tokenUser := addTokenToUser(databaseUser, tokenString, refreshToken.Token)
+	respondWithJSON(w, 200, tokenUser)
 
 }
 
 // handler to create a chirp from a POST request
 func (cfg *apiConfig) createChirpWriter(w http.ResponseWriter, req *http.Request) {
+	tokenString, errToken := auth.GetBearerToken(req.Header)
+	fmt.Printf("The tokenString is %s\n", tokenString)
+	if errToken != nil {
+		respondWithError(w, 401, errToken.Error())
+		return
+	}
+
 	type parameters struct {
-		Body    string    `json:"body"`
-		User_id uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
 	}
 	decoder := json.NewDecoder(req.Body)
 	params := parameters{}
@@ -191,6 +227,13 @@ func (cfg *apiConfig) createChirpWriter(w http.ResponseWriter, req *http.Request
 		w.WriteHeader(500)
 		return
 	}
+	fmt.Printf("received token: %q\n", tokenString)
+	uuidVar, errJWT := auth.ValidateJWT(tokenString, cfg.secret)
+	fmt.Printf("uuidVar is %v\n", uuidVar)
+	if errJWT != nil {
+		respondWithError(w, 401, errJWT.Error())
+		return
+	}
 	if len(params.Body) > 140 {
 		respondWithError(w, 400, "Chirp is too long")
 		return
@@ -198,11 +241,11 @@ func (cfg *apiConfig) createChirpWriter(w http.ResponseWriter, req *http.Request
 	cleanedChirp := censorChirp(params.Body)
 	insertDatabaseChirp := database.CreateChirpParams{
 		Body:   cleanedChirp,
-		UserID: params.User_id,
+		UserID: uuidVar,
 	}
 	databaseChirp, err := cfg.db.CreateChirp(req.Context(), insertDatabaseChirp)
 	if err != nil {
-		respondWithError(w, 400, "Unable to make the Chirp.")
+		respondWithError(w, 400, err.Error())
 		return
 	}
 	jsonChirp := turnChirpToJson(databaseChirp)
@@ -214,7 +257,7 @@ func (cfg *apiConfig) createChirpWriter(w http.ResponseWriter, req *http.Request
 func (cfg *apiConfig) getAllChirps(w http.ResponseWriter, req *http.Request) {
 	allChirps, err := cfg.db.GetAllChirps(req.Context())
 	if err != nil {
-		respondWithError(w, 400, "Unable to retrieve Chirps.")
+		respondWithError(w, 400, err.Error())
 		return
 	}
 	jsonChirpSlice := make([]jsonChirp, 0, len(allChirps))
@@ -249,6 +292,92 @@ func (cfg *apiConfig) getSingleChirp(w http.ResponseWriter, req *http.Request) {
 	}
 	jsonChirp := turnChirpToJson(chirp)
 	respondWithJSON(w, 200, jsonChirp)
+}
+
+func (cfg *apiConfig) refreshJWTToken(w http.ResponseWriter, req *http.Request) {
+	refreshHeader, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, "Bearer Token not present.")
+		return
+	}
+	refreshToken, err := cfg.db.GetRefreshToken(req.Context(), refreshHeader)
+	if err != nil {
+		respondWithError(w, 401, "This token does not exist in the database.")
+		return
+	}
+	now := time.Now()
+	if refreshToken.ExpiresAt.Time.Before(now) || refreshToken.ExpiresAt.Time.Equal(now) {
+		respondWithError(w, 401, "This token is expired.")
+		return
+	}
+	if !refreshToken.RevokedAt.Time.IsZero() {
+		respondWithError(w, 401, "This token has been revoked.")
+		return
+	}
+	givenUser, err := cfg.db.GetSingleUserFromRefreshToken(req.Context(), refreshToken.Token)
+	if err != nil {
+		respondWithError(w, 401, "User does not exist.")
+		return
+	}
+	jwtToken, err := auth.MakeJWT(givenUser.UserID, cfg.secret, time.Duration(EXPIRETIME)*time.Second)
+	jsonToken := struct {
+		Token string `json:"token"`
+	}{
+		Token: jwtToken,
+	}
+	respondWithJSON(w, 200, jsonToken)
+}
+
+func (cfg *apiConfig) revokeToken(w http.ResponseWriter, req *http.Request) {
+	refreshHeader, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, "Bearer Token not present.")
+		return
+	}
+	errRevoke := cfg.db.RevokeToken(req.Context(), refreshHeader)
+	if errRevoke != nil {
+		respondWithError(w, 401, "This token does not exist in the database.")
+		return
+	}
+	w.WriteHeader(204)
+}
+
+func (cfg *apiConfig) authorizeUser(w http.ResponseWriter, req *http.Request) {
+	type parameters struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	authToken, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, "Missing auth token")
+		return
+	}
+	params := parameters{}
+	decoder := json.NewDecoder(req.Body)
+	err = decoder.Decode(&params)
+	if err != nil {
+		respondWithError(w, 500, "Something went wrong during decoding")
+		return
+	}
+	hashedPassword, err := auth.HashPassword(params.Password)
+	if err != nil {
+		respondWithError(w, 403, err.Error())
+	}
+	userUUID, err := auth.ValidateJWT(authToken, cfg.secret)
+	newUserDetails := database.UpdateUserEmailAndPasswordParams{
+		Email:          params.Email,
+		HashedPassword: hashedPassword,
+		ID:             userUUID,
+	}
+	newUser, err := cfg.db.UpdateUserEmailAndPassword(req.Context(), newUserDetails)
+	if err != nil {
+		respondWithError(w, 401, err.Error())
+		return
+	}
+	newUser.HashedPassword = "REDACTED"
+	jsonUser := turnUserToJson(newUser)
+	respondWithJSON(w, 200, jsonUser)
+
 }
 
 // helper function to turn a database chirp into a JSON ready struct for marshaling.
@@ -371,5 +500,8 @@ func main() {
 	serveMux.HandleFunc("POST /api/chirps", cfg.createChirpWriter)
 	serveMux.HandleFunc("GET /api/chirps/{chirpID}", cfg.getSingleChirp)
 	serveMux.HandleFunc("POST /api/login", cfg.loginUser)
+	serveMux.HandleFunc("POST /api/refresh", cfg.refreshJWTToken)
+	serveMux.HandleFunc("POST /api/revoke", cfg.revokeToken)
+	serveMux.HandleFunc("PUT /api/users", cfg.authorizeUser)
 	server.ListenAndServe()
 }
